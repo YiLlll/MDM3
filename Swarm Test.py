@@ -12,6 +12,7 @@ from collections import defaultdict
 from scipy.spatial import cKDTree
 import os
 import pickle
+from matplotlib.lines import Line2D
 
 warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
 
@@ -22,27 +23,23 @@ SCRIPT_DIR = Path(__file__).parent
 GEOJSON_PATH = SCRIPT_DIR / "area6_combined_routes.geojson"
 DEPOT_CSV_PATH = SCRIPT_DIR / "depot_details.csv"
 
-# performance & behavior
+# performance & behaviour
 AVERAGE_SPEED_KMH = 80
-TIME_LIMIT_HOURS = 2.0
-BUFFER_METERS = 100
+BUFFER_METERS = 1000
 
 # ACO parameters
 ACO_ENABLED = True
-N_ANTS = 20            # ants per vehicle
-N_ITERATIONS = 70      # iterations per vehicle's pheromone update
-ALPHA = 1.5
+N_ANTS = 12            # ants per vehicle
+N_ITERATIONS = 20      # iterations per vehicle's pheromone update
+ALPHA = 0.7
 BETA = 3.0
-RHO = 0.5
+RHO = 0.1
 
 # multi-vehicle
 VEHICLES_PER_DEPOT = 4   # number of vehicles starting from each depot
 
-# node sampling for ACO (limits work set size)
-SAMPLED_NODE_COUNT = 2000  # number of sample nodes used for candidate moves (keeps memory low)
-
 # simplification tolerance (meters in projected CRS)
-SIMPLIFY_TOLERANCE = 1000
+SIMPLIFY_TOLERANCE = 200
 
 # max iterations for connecting subnetworks (safety)
 MAX_CONNECT_ITER = 10000
@@ -50,6 +47,11 @@ MAX_CONNECT_ITER = 10000
 # Cache files (so you don't reconnect every run)
 GRAPH_CACHE_PATH = SCRIPT_DIR / "connected_network.pkl"     # saves (G, bridge_gdf)
 SAVE_CONNECTED_GEOJSON = SCRIPT_DIR / "connected_bridges.geojson"  # optional bridge geojson
+
+# =====================
+# SUBNETWORK REBUILD CONTROL
+# =====================
+FORCE_RECONNECT_SUBNETWORKS = False   # True = always rebuild subnetworks
 
 # =====================
 # HELPERS
@@ -292,39 +294,74 @@ def make_oriented_edges(G):
 # =====================
 # MULTI-VEHICLE, MULTI-DEPOT ACO (MEMORY-EFFICIENT)
 # =====================
-def multi_depot_multi_vehicle_aco(G, depot_nodes, oriented_edges, start_map, edge_weight,
-                                  vehicles_per_depot=2, n_ants=8, n_iter=15, time_limit_h=2.0):
-    results = []
-    epsilon = 1e-9
+def multi_depot_multi_vehicle_aco(
+    G, depot_nodes, oriented_edges, start_map, edge_weight,
+    vehicles_per_depot=2, n_ants=10, n_iter=100,
+    alpha=0.8, beta=3.0, rho=0.1,
+    start_radius=8, teleport_max_dist_m=10000,
+    AVERAGE_SPEED_KMH=80  # <-- added here
+):
+    """
+    Robust multi-depot multi-vehicle ACO with average hours per vehicle.
+    """
+
+    epsilon = 1e-12
     oriented_index_map = {edge: i for i, edge in enumerate(oriented_edges)}
+    total_edges = len(oriented_edges)
+
+    def nearby_edges(G, depot_node, radius):
+        visited_nodes = {depot_node}
+        queue = [(depot_node, 0)]
+        nearby = []
+        while queue:
+            node, dist = queue.pop(0)
+            if dist < radius:
+                for nb in G.neighbors(node):
+                    if nb not in visited_nodes:
+                        visited_nodes.add(nb)
+                        queue.append((nb, dist + 1))
+                    edge = (node, nb)
+                    if edge in oriented_index_map:
+                        nearby.append(oriented_index_map[edge])
+                    rev = (nb, node)
+                    if rev in oriented_index_map:
+                        nearby.append(oriented_index_map[rev])
+        return list(dict.fromkeys(nearby))
+
+    global_tau = {i: 1.0 for i in range(total_edges)}
+    global_covered_edges = set()
+    results = []
 
     for depot_idx, depot_node in enumerate(depot_nodes):
         print(f"\n--- Depot {depot_idx + 1}/{len(depot_nodes)} ---")
-        start_edges = start_map.get(depot_node, [])
+
+        if start_map and depot_node in start_map and start_map[depot_node]:
+            start_edges = list(start_map[depot_node])
+        else:
+            start_edges = nearby_edges(G, depot_node, start_radius)
         if not start_edges:
             nearest_edge = min(oriented_edges, key=lambda e: euclid(e[0], depot_node))
             start_edges = [oriented_index_map[nearest_edge]]
 
-        covered_edges = set()
+        depot_covered = set()
         vehicle_routes = []
-        base_tau = {i: 1.0 for i in range(len(oriented_edges))}
 
         for vehicle_num in range(vehicles_per_depot):
-            best_vehicle_route = None
-            best_vehicle_score = -1
-            best_vehicle_time = None
-            tau = base_tau.copy()
+            print(f"\n🚚 Vehicle {vehicle_num+1} starting from Depot {depot_idx+1}")
+            best_vehicle_score = -1.0
 
-            for iteration in range(n_iter):
-                ant_routes, ant_scores, ant_times = [], [], []
+            for iteration in range(1, n_iter + 1):
+                ant_routes, ant_scores = [], []
 
                 for ant in range(n_ants):
                     current_idx = random.choice(start_edges)
-                    route = [current_idx]
-                    visited = {current_idx}
-                    time_used = 0.0
+                    route, visited = [current_idx], {current_idx}
+                    steps = 0
 
                     while True:
+                        steps += 1
+                        if steps > 2000:
+                            break
                         current_end = oriented_edges[current_idx][1]
                         if current_end not in G:
                             break
@@ -332,90 +369,88 @@ def multi_depot_multi_vehicle_aco(G, depot_nodes, oriented_edges, start_map, edg
                         neighbors = list(G.neighbors(current_end))
                         candidates = []
                         for nb in neighbors:
-                            edge = (current_end, nb)
-                            if edge in oriented_index_map:
-                                e_idx = oriented_index_map[edge]
-                                if e_idx not in visited:
-                                    candidates.append(e_idx)
+                            e = (current_end, nb)
+                            rev = (nb, current_end)
+                            for edge in [e, rev]:
+                                if edge in oriented_index_map:
+                                    e_idx = oriented_index_map[edge]
+                                    if e_idx not in visited or e_idx not in global_covered_edges:
+                                        candidates.append(e_idx)
+                        candidates = list(dict.fromkeys(candidates))
 
                         if not candidates:
+                            uncovered_edges = [e for e in range(total_edges) if e not in global_covered_edges]
+                            if not uncovered_edges:
+                                break
+                            min_dist, chosen_uncovered = float("inf"), None
+                            for e in uncovered_edges:
+                                dist = euclid(current_end, oriented_edges[e][0])
+                                if dist < min_dist:
+                                    min_dist, chosen_uncovered = dist, e
+                            if chosen_uncovered is not None and min_dist <= teleport_max_dist_m:
+                                current_idx = chosen_uncovered
+                                route.append(current_idx)
+                                visited.add(current_idx)
+                                continue
+                            else:
+                                break
+
+                        phs = np.array([global_tau[c] for c in candidates], dtype=float)
+                        lengths = np.array([edge_weight.get(oriented_edges[c], euclid(*oriented_edges[c])) for c in candidates])
+                        heur = 1.0 / np.maximum(lengths, epsilon)
+                        unvisited_boost = np.array([1.5 if c not in global_covered_edges else 1.0 for c in candidates])
+                        probs_raw = (phs ** alpha) * (heur ** beta) * unvisited_boost
+                        total_prob = probs_raw.sum()
+
+                        if total_prob <= 0 or np.isnan(total_prob):
+                            chosen = random.choice(candidates)
+                        else:
+                            probs = probs_raw / total_prob
+                            probs = np.maximum(probs, 0)
+                            s = probs.sum()
+                            chosen = np.random.choice(candidates, p=probs / s) if s > 0 else random.choice(candidates)
+
+                        route.append(chosen)
+                        visited.add(chosen)
+                        current_idx = chosen
+
+                        if len(route) > 5000:
                             break
 
-                        phs = np.array([tau[c] for c in candidates], dtype=float)
-                        lengths = np.array([edge_weight[oriented_edges[c]] for c in candidates], dtype=float)
-                        heur = 1.0 / (lengths + epsilon)
-                        uncovered_bonus = np.array([1.5 if c not in covered_edges else 1.0 for c in candidates])
-                        probs_raw = (phs ** ALPHA) * (heur ** BETA) * uncovered_bonus
-                        s = probs_raw.sum()
-
-                        if s <= 0 or np.isnan(s):
-                            break
-                        probs = probs_raw / s
-                        probs = probs / probs.sum()
-                        if not np.isclose(probs.sum(), 1.0):
-                            probs = np.ones(len(candidates)) / len(candidates)
-
-                        next_idx = np.random.choice(candidates, p=probs)
-                        edge_m = edge_weight[oriented_edges[next_idx]]
-                        t_edge = travel_time_hours(edge_m)
-
-                        next_end = oriented_edges[next_idx][1]
-                        try:
-                            ret_m = nx.shortest_path_length(G, source=next_end, target=depot_node, weight="weight")
-                        except nx.NetworkXNoPath:
-                            ret_m = float("inf")
-                        t_return = travel_time_hours(ret_m)
-
-                        if time_used + t_edge + t_return > time_limit_h:
-                            break
-
-                        route.append(next_idx)
-                        visited.add(next_idx)
-                        time_used += t_edge
-                        current_idx = next_idx
-
-                    # Reward exploring new edges efficiently, penalize underusing time
-                    new_edges = len([e for e in route if e not in covered_edges])
-                    time_ratio = min(1.0, time_used / time_limit_h)
-
-                    # Balanced scoring: prioritize edge coverage and effective use of time
-                    score = new_edges * (1.0 - 0.5 * time_ratio)
-
+                    total_distance = sum(edge_weight.get(oriented_edges[e], euclid(*oriented_edges[e])) for e in route)
                     ant_routes.append(route)
-                    ant_scores.append(score)
-                    ant_times.append(time_used)
+                    ant_scores.append(total_distance)
 
                 if ant_scores:
-                    iter_best_idx = int(np.argmax(ant_scores))
-                    iter_best_score = ant_scores[iter_best_idx]
-                    iter_best_route = ant_routes[iter_best_idx]
-                    iter_best_time = ant_times[iter_best_idx]
+                    best_idx = int(np.argmax(ant_scores))
+                    best_route = ant_routes[best_idx]
+                    best_score = ant_scores[best_idx]
 
-                    for e_idx in iter_best_route:
-                        tau[e_idx] += iter_best_score / (1.0 + iter_best_time)
+                    for e_idx in best_route:
+                        global_tau[e_idx] = (1 - rho) * global_tau.get(e_idx, 1.0) + rho * best_score
+                    newly_covered = [e for e in best_route if e not in global_covered_edges]
+                    if newly_covered:
+                        global_covered_edges.update(newly_covered)
+                        depot_covered.update(newly_covered)
+                    if best_score > best_vehicle_score:
+                        best_vehicle_score = best_score
 
-                    if iter_best_score > best_vehicle_score:
-                        best_vehicle_score = iter_best_score
-                        best_vehicle_route = iter_best_route[:]
-                        best_vehicle_time = iter_best_time
+                if len(global_covered_edges) >= total_edges:
+                    break
 
-                if iteration % max(1, n_iter // 5) == 0:
-                    print(f"    Iter {iteration+1}/{n_iter} – Vehicle {vehicle_num+1}: "
-                          f"best score {best_vehicle_score:.2f}, time {best_vehicle_time or 0:.2f}h")
+            vehicle_routes.append((vehicle_num, list(depot_covered), best_vehicle_score, len(depot_covered)))
+            print(f"✅ Vehicle {vehicle_num+1}: depot-covered edges so far {len(depot_covered)} / {total_edges}")
 
-            if best_vehicle_route:
-                newly_covered = [e for e in best_vehicle_route if e not in covered_edges]
-                covered_edges.update(newly_covered)
-                vehicle_routes.append((vehicle_num, best_vehicle_route, best_vehicle_time, len(newly_covered)))
-                print(f"  Vehicle {vehicle_num+1}: covered {len(newly_covered)} new edges, time {best_vehicle_time:.2f}h")
-            else:
-                vehicle_routes.append((vehicle_num, [], 0.0, 0))
-                print(f"  Vehicle {vehicle_num+1}: no feasible route found")
+        avg_hours_per_vehicle = np.mean([v[2] / (AVERAGE_SPEED_KMH * 1000 / 60) for v in vehicle_routes if v[2] > 0])
 
-        total_possible = len(oriented_edges)
-        results.append((depot_idx, vehicle_routes, len(covered_edges), total_possible))
-        print(f"Depot {depot_idx+1} summary: covered {len(covered_edges)}/{total_possible} oriented edges")
+        results.append((depot_idx, vehicle_routes, len(global_covered_edges), total_edges, avg_hours_per_vehicle))
+        print(f"\n🏁 Depot {depot_idx+1}: avg hours/vehicle = {avg_hours_per_vehicle:.2f} hrs")
 
+        if len(global_covered_edges) >= total_edges:
+            break
+
+    print(f"\n✅ FINAL GLOBAL COVERAGE: {len(global_covered_edges)}/{total_edges} "
+          f"({100.0 * len(global_covered_edges) / max(1, total_edges):.1f}%)")
     return results
 
 # =====================
@@ -437,30 +472,40 @@ def plot_initial_map(routes_gdf, depot_gdf):
     plt.tight_layout()
     plt.show()
 
-def plot_results_multi(routes_gdf, depot_gdf, oriented_edges, results):
+def plot_results_multi(routes_gdf, depot_gdf, oriented_edges, results, depot_nodes):
     fig, ax = plt.subplots(figsize=(12, 10))
     routes_gdf.plot(ax=ax, color="lightgray", linewidth=1.2, alpha=0.8, zorder=1)
 
-    # plot depots
     if not depot_gdf.empty:
-        depot_gdf.plot(ax=ax, color="orange", markersize=70, marker="*", edgecolor="black", zorder=4, label="Depots")
+        depot_gdf.plot(ax=ax, color="orange", markersize=70, marker="*", edgecolor="black", zorder=4)
+        for depot_idx, depot_node in enumerate(depot_nodes):
+            node_x, node_y = depot_node
+            depot_gdf["dist_tmp_for_label"] = depot_gdf.geometry.distance(Point(node_x, node_y))
+            nearest = depot_gdf.loc[depot_gdf["dist_tmp_for_label"].idxmin()]
+            geom = nearest.geometry
+            ax.text(geom.x + 1000, geom.y + 1000, str(depot_idx + 1),
+                    fontsize=10, color="black", weight="bold", zorder=6)
+        depot_gdf.drop(columns=["dist_tmp_for_label"], inplace=True, errors="ignore")
 
     cmap = plt.cm.get_cmap("tab10")
-    for ridx, (depot_idx, vehicle_routes, covered, total) in enumerate(results):
-        color = cmap(ridx % 10)
-        for vnum, route, time_used, new_count in vehicle_routes:
+    for ridx, (depot_idx, vehicle_routes, _, total, avg_hours) in enumerate(results):
+        color = cmap(depot_idx % 10)
+        per_depot_set = set()
+        for vnum, vlist, score, cnt in vehicle_routes:
+            if isinstance(vlist, list):
+                per_depot_set.update(vlist)
+        for vnum, route, travel_m, new_count in vehicle_routes:
             if not route:
                 continue
-            # plot sequence of oriented edges as segments
             for e_idx in route:
                 a, b = oriented_edges[e_idx]
-                ax.plot([a[0], b[0]], [a[1], b[1]], color=color, linewidth=2.5, alpha=0.9, zorder=3)
-        # label
-        ax.text(0.01, 0.98 - ridx*0.03, f"Depot {depot_idx+1}: covered {covered} oriented edges", transform=ax.transAxes, color=color, fontsize=9)
+                ax.plot([a[0], b[0]], [a[1], b[1]], color=color, linewidth=2.0, alpha=0.9, zorder=3)
+        ax.text(0.01, 0.98 - ridx * 0.04,
+                f"Depot {depot_idx+1}: {len(per_depot_set)}/{total} edges | Avg hrs/veh: {avg_hours:.1f}",
+                transform=ax.transAxes, color=color, fontsize=9)
 
     ax.set_aspect("equal")
-    ax.set_title("Multi-Depot Multi-Vehicle ACO Results")
-    plt.legend()
+    ax.set_title("Multi-Depot Multi-Vehicle ACO Results (Per-depot Coverage & Avg Hours)")
     plt.tight_layout()
     plt.show()
 
@@ -475,7 +520,7 @@ def main():
     G = build_graph_from_routes(routes_gdf)
 
     # -------------------------
-    # Show subnetworks (each in different colour) and list counts
+    # Show subnetworks (each in different colour)
     # -------------------------
     plot_graph_subnetworks(
         G,
@@ -484,46 +529,49 @@ def main():
     )
 
     # -------------------------
-    # Connect all subnetworks together (bridge shortest gaps)
+    # Connect all subnetworks (load cache or rebuild)
     # -------------------------
-    # Load from cache if available, otherwise connect and save
     bridge_gdf = gpd.GeoDataFrame(geometry=[], crs="EPSG:3857")
-    if GRAPH_CACHE_PATH.exists():
+
+    rebuild = False
+    if FORCE_RECONNECT_SUBNETWORKS:
+        print("\nFORCE_RECONNECT_SUBNETWORKS=True → rebuilding subnetworks from scratch.")
+        rebuild = True
+    elif not GRAPH_CACHE_PATH.exists():
+        print("\nNo existing cache found → building subnetworks.")
+        rebuild = True
+    else:
+        print(f"\nLoading connected graph from cache: {GRAPH_CACHE_PATH}")
         try:
-            print(f"Loading connected graph from cache: {GRAPH_CACHE_PATH}")
             with open(GRAPH_CACHE_PATH, "rb") as f:
                 G, bridge_gdf = pickle.load(f)
-            print("Loaded cached connected graph.")
+            print("✅ Loaded cached connected graph successfully.")
         except Exception as e:
-            print(f"Failed to load cache ({e}), will rebuild bridges.")
-            G, bridge_gdf = connect_subnetworks(G)
-            # save
-            with open(GRAPH_CACHE_PATH, "wb") as f:
-                pickle.dump((G, bridge_gdf), f)
-            print(f"Saved connected graph to {GRAPH_CACHE_PATH}")
-    else:
+            print(f"⚠️ Cache load failed ({e}). Rebuilding subnetworks instead.")
+            rebuild = True
+
+    if rebuild:
         G, bridge_gdf = connect_subnetworks(G)
-        # save
         try:
             with open(GRAPH_CACHE_PATH, "wb") as f:
                 pickle.dump((G, bridge_gdf), f)
-            print(f"Saved connected graph to {GRAPH_CACHE_PATH}")
+            print(f"✅ Saved connected graph to {GRAPH_CACHE_PATH}")
         except Exception as e:
-            print(f"Warning: could not save connected graph cache: {e}")
+            print(f"⚠️ Could not save connected graph cache: {e}")
 
-    # optionally save bridge GeoJSON for reuse in GIS
+    # Optionally save bridge GeoJSON
     try:
         if not bridge_gdf.empty:
             bridge_gdf.to_file(SAVE_CONNECTED_GEOJSON, driver="GeoJSON")
-            print(f"Saved added bridge edges to {SAVE_CONNECTED_GEOJSON}")
+            print(f"✅ Saved added bridge edges to {SAVE_CONNECTED_GEOJSON}")
     except Exception as e:
-        print(f"Could not save bridge geojson: {e}")
+        print(f"⚠️ Could not save bridge GeoJSON: {e}")
 
-    # Plot final fully connected network
+    # -------------------------
+    # Plot unified connected network
+    # -------------------------
     fig, ax = plt.subplots(figsize=(10, 8))
-    # Original routes (gray)
     routes_gdf.plot(ax=ax, color="lightgray", linewidth=0.8, alpha=0.6)
-    # Bridge edges (red)
     if not bridge_gdf.empty:
         bridge_gdf.plot(ax=ax, color="red", linewidth=1.2, label="Added Bridge Edges", zorder=5)
     plt.title("Unified Network After Connecting Subnetworks")
@@ -532,9 +580,10 @@ def main():
     plt.tight_layout()
     plt.show()
 
-    depot_nodes = connect_depots_to_graph(G, depot_gdf)  # adds depot nodes and edges to G
-
-    # build oriented edges and adjacency
+    # -------------------------
+    # Connect depots & run ACO
+    # -------------------------
+    depot_nodes = connect_depots_to_graph(G, depot_gdf)
     oriented_edges, start_map, edge_weight = make_oriented_edges(G)
 
     if ACO_ENABLED and len(depot_nodes) > 0:
@@ -542,12 +591,14 @@ def main():
             G, depot_nodes,
             oriented_edges, start_map, edge_weight,
             vehicles_per_depot=VEHICLES_PER_DEPOT,
-            n_ants=N_ANTS, n_iter=N_ITERATIONS, time_limit_h=TIME_LIMIT_HOURS
+            n_ants=N_ANTS, n_iter=N_ITERATIONS,
+
         )
         print("\nACO finished for all depots.")
-        plot_results_multi(routes_gdf, depot_gdf, oriented_edges, results)
+        plot_results_multi(routes_gdf, depot_gdf, oriented_edges, results, depot_nodes)
     else:
         print("ACO disabled or no depots found; only initial map shown.")
+
 
 if __name__ == "__main__":
     main()
