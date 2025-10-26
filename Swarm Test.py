@@ -31,12 +31,12 @@ BUFFER_METERS = 1000
 ACO_ENABLED = True
 N_ANTS = 12            # ants per vehicle
 N_ITERATIONS = 20      # iterations per vehicle's pheromone update
-ALPHA = 0.7
-BETA = 3.0
+ALPHA = 0.5
+BETA = 5.0
 RHO = 0.1
 
 # multi-vehicle
-VEHICLES_PER_DEPOT = 4   # number of vehicles starting from each depot
+VEHICLES_PER_DEPOT = 8   # number of vehicles starting from each depot
 
 # simplification tolerance (meters in projected CRS)
 SIMPLIFY_TOLERANCE = 200
@@ -231,9 +231,7 @@ def plot_connected_network(routes_gdf, bridge_gdf):
 # =====================
 def plot_graph_subnetworks(G, depot_nodes=None, title="Road Network Subnetworks"):
     comps = list(nx.connected_components(G.to_undirected()))
-    print(f"\nDetected {len(comps)} subnetworks:")
-    for i, comp in enumerate(comps, start=1):
-        print(f"  Subnetwork {i}: {len(comp)} nodes")
+    print(f"\nDetected {len(comps)} subnetworks")
 
     num = len(comps)
     cmap = plt.cm.get_cmap("tab20", num if num <= 20 else num)
@@ -297,14 +295,15 @@ def make_oriented_edges(G):
 def multi_depot_multi_vehicle_aco(
     G, depot_nodes, oriented_edges, start_map, edge_weight,
     vehicles_per_depot=2, n_ants=10, n_iter=100,
-    alpha=0.8, beta=3.0, rho=0.1,
-    start_radius=8, teleport_max_dist_m=10000,
-    AVERAGE_SPEED_KMH=80  # <-- added here
+    alpha=1.0, beta=2.0, rho=0.3,
+    start_radius=8, teleport_max_dist_m=10000
 ):
     """
-    Robust multi-depot multi-vehicle ACO with average hours per vehicle.
+    Multi-depot multi-vehicle ACO storing per-vehicle and per-depot coverage.
+    Returns a list of results:
+      (depot_idx, vehicle_routes, n_global_covered, total_edges,
+       total_distance_depot_m, avg_time_per_vehicle_h, avg_distance_per_vehicle_m)
     """
-
     epsilon = 1e-12
     oriented_index_map = {edge: i for i, edge in enumerate(oriented_edges)}
     total_edges = len(oriented_edges)
@@ -320,12 +319,9 @@ def multi_depot_multi_vehicle_aco(
                     if nb not in visited_nodes:
                         visited_nodes.add(nb)
                         queue.append((nb, dist + 1))
-                    edge = (node, nb)
-                    if edge in oriented_index_map:
-                        nearby.append(oriented_index_map[edge])
-                    rev = (nb, node)
-                    if rev in oriented_index_map:
-                        nearby.append(oriented_index_map[rev])
+                    for e in [(node, nb), (nb, node)]:
+                        if e in oriented_index_map:
+                            nearby.append(oriented_index_map[e])
         return list(dict.fromkeys(nearby))
 
     global_tau = {i: 1.0 for i in range(total_edges)}
@@ -335,6 +331,7 @@ def multi_depot_multi_vehicle_aco(
     for depot_idx, depot_node in enumerate(depot_nodes):
         print(f"\n--- Depot {depot_idx + 1}/{len(depot_nodes)} ---")
 
+        # Find start edges
         if start_map and depot_node in start_map and start_map[depot_node]:
             start_edges = list(start_map[depot_node])
         else:
@@ -348,20 +345,23 @@ def multi_depot_multi_vehicle_aco(
 
         for vehicle_num in range(vehicles_per_depot):
             print(f"\n🚚 Vehicle {vehicle_num+1} starting from Depot {depot_idx+1}")
-            best_vehicle_score = -1.0
+            vehicle_edge_set = set()
 
             for iteration in range(1, n_iter + 1):
-                ant_routes, ant_scores = [], []
+                ant_routes = []
+                ant_scores = []
 
                 for ant in range(n_ants):
                     current_idx = random.choice(start_edges)
-                    route, visited = [current_idx], {current_idx}
+                    route = [current_idx]
+                    visited = set(route)
                     steps = 0
 
                     while True:
                         steps += 1
-                        if steps > 2000:
+                        if steps > 5000:
                             break
+
                         current_end = oriented_edges[current_idx][1]
                         if current_end not in G:
                             break
@@ -369,24 +369,24 @@ def multi_depot_multi_vehicle_aco(
                         neighbors = list(G.neighbors(current_end))
                         candidates = []
                         for nb in neighbors:
-                            e = (current_end, nb)
-                            rev = (nb, current_end)
-                            for edge in [e, rev]:
-                                if edge in oriented_index_map:
-                                    e_idx = oriented_index_map[edge]
+                            for e in [(current_end, nb), (nb, current_end)]:
+                                if e in oriented_index_map:
+                                    e_idx = oriented_index_map[e]
                                     if e_idx not in visited or e_idx not in global_covered_edges:
                                         candidates.append(e_idx)
-                        candidates = list(dict.fromkeys(candidates))
 
                         if not candidates:
                             uncovered_edges = [e for e in range(total_edges) if e not in global_covered_edges]
                             if not uncovered_edges:
                                 break
-                            min_dist, chosen_uncovered = float("inf"), None
+                            min_dist = float("inf")
+                            chosen_uncovered = None
                             for e in uncovered_edges:
-                                dist = euclid(current_end, oriented_edges[e][0])
-                                if dist < min_dist:
-                                    min_dist, chosen_uncovered = dist, e
+                                start_node = oriented_edges[e][0]
+                                d = euclid(current_end, start_node)
+                                if d < min_dist:
+                                    min_dist = d
+                                    chosen_uncovered = e
                             if chosen_uncovered is not None and min_dist <= teleport_max_dist_m:
                                 current_idx = chosen_uncovered
                                 route.append(current_idx)
@@ -396,9 +396,9 @@ def multi_depot_multi_vehicle_aco(
                                 break
 
                         phs = np.array([global_tau[c] for c in candidates], dtype=float)
-                        lengths = np.array([edge_weight.get(oriented_edges[c], euclid(*oriented_edges[c])) for c in candidates])
+                        lengths = np.array([edge_weight.get(oriented_edges[c], euclid(*oriented_edges[c])) for c in candidates], dtype=float)
                         heur = 1.0 / np.maximum(lengths, epsilon)
-                        unvisited_boost = np.array([1.5 if c not in global_covered_edges else 1.0 for c in candidates])
+                        unvisited_boost = np.array([5.0 if c not in global_covered_edges else 0.2 for c in candidates])
                         probs_raw = (phs ** alpha) * (heur ** beta) * unvisited_boost
                         total_prob = probs_raw.sum()
 
@@ -408,49 +408,62 @@ def multi_depot_multi_vehicle_aco(
                             probs = probs_raw / total_prob
                             probs = np.maximum(probs, 0)
                             s = probs.sum()
-                            chosen = np.random.choice(candidates, p=probs / s) if s > 0 else random.choice(candidates)
+                            if s <= 0 or np.isnan(s):
+                                chosen = random.choice(candidates)
+                            else:
+                                probs = probs / s
+                                chosen = np.random.choice(candidates, p=probs)
 
                         route.append(chosen)
                         visited.add(chosen)
                         current_idx = chosen
-
                         if len(route) > 5000:
                             break
 
-                    total_distance = sum(edge_weight.get(oriented_edges[e], euclid(*oriented_edges[e])) for e in route)
+                    total_distance_m = sum(edge_weight.get(oriented_edges[e], euclid(*oriented_edges[e])) for e in route)
                     ant_routes.append(route)
-                    ant_scores.append(total_distance)
+                    ant_scores.append(total_distance_m)
 
+                # Best ant for this iteration
                 if ant_scores:
                     best_idx = int(np.argmax(ant_scores))
-                    best_route = ant_routes[best_idx]
-                    best_score = ant_scores[best_idx]
+                    ant_best_route = ant_routes[best_idx]
+                    for e_idx in ant_best_route:
+                        global_tau[e_idx] = (1 - rho) * global_tau.get(e_idx, 1.0) + rho * ant_scores[best_idx]
+                    vehicle_edge_set.update(ant_best_route)
+                    depot_covered.update(ant_best_route)
+                    global_covered_edges.update(ant_best_route)
 
-                    for e_idx in best_route:
-                        global_tau[e_idx] = (1 - rho) * global_tau.get(e_idx, 1.0) + rho * best_score
-                    newly_covered = [e for e in best_route if e not in global_covered_edges]
-                    if newly_covered:
-                        global_covered_edges.update(newly_covered)
-                        depot_covered.update(newly_covered)
-                    if best_score > best_vehicle_score:
-                        best_vehicle_score = best_score
+                if iteration % max(1, n_iter // 10) == 0:
+                    print(f"  Iter {iteration:03d}: global coverage {len(global_covered_edges)}/{total_edges}")
 
                 if len(global_covered_edges) >= total_edges:
                     break
 
-            vehicle_routes.append((vehicle_num, list(depot_covered), best_vehicle_score, len(depot_covered)))
-            print(f"✅ Vehicle {vehicle_num+1}: depot-covered edges so far {len(depot_covered)} / {total_edges}")
+            # Append per-vehicle info
+            vehicle_routes.append((
+                vehicle_num,
+                list(vehicle_edge_set),
+                sum(edge_weight.get(oriented_edges[e], euclid(*oriented_edges[e])) for e in vehicle_edge_set),
+                len(vehicle_edge_set)
+            ))
 
-        avg_hours_per_vehicle = np.mean([v[2] / (AVERAGE_SPEED_KMH * 1000 / 60) for v in vehicle_routes if v[2] > 0])
+        # Depot-level distance/time
+        total_distance_depot_m = sum(edge_weight.get(oriented_edges[e], euclid(*oriented_edges[e])) for e in depot_covered)
+        total_distance_km = total_distance_depot_m / 1000.0
+        avg_distance_per_vehicle_m = total_distance_depot_m / vehicles_per_depot
+        avg_time_per_vehicle_h = (total_distance_km / vehicles_per_depot) / AVERAGE_SPEED_KMH
 
-        results.append((depot_idx, vehicle_routes, len(global_covered_edges), total_edges, avg_hours_per_vehicle))
-        print(f"\n🏁 Depot {depot_idx+1}: avg hours/vehicle = {avg_hours_per_vehicle:.2f} hrs")
+        results.append((
+            depot_idx, vehicle_routes, len(global_covered_edges),
+            total_edges, total_distance_depot_m, avg_time_per_vehicle_h,
+            avg_distance_per_vehicle_m
+        ))
 
         if len(global_covered_edges) >= total_edges:
             break
 
-    print(f"\n✅ FINAL GLOBAL COVERAGE: {len(global_covered_edges)}/{total_edges} "
-          f"({100.0 * len(global_covered_edges) / max(1, total_edges):.1f}%)")
+    print(f"\n✅ FINAL GLOBAL COVERAGE: {len(global_covered_edges)}/{total_edges}")
     return results
 
 # =====================
@@ -473,9 +486,14 @@ def plot_initial_map(routes_gdf, depot_gdf):
     plt.show()
 
 def plot_results_multi(routes_gdf, depot_gdf, oriented_edges, results, depot_nodes):
+    """
+    Plot depot routes with per-vehicle edges visible.
+    Shows per-depot coverage, total distance, and avg time/vehicle.
+    """
     fig, ax = plt.subplots(figsize=(12, 10))
     routes_gdf.plot(ax=ax, color="lightgray", linewidth=1.2, alpha=0.8, zorder=1)
 
+    # Plot depots
     if not depot_gdf.empty:
         depot_gdf.plot(ax=ax, color="orange", markersize=70, marker="*", edgecolor="black", zorder=4)
         for depot_idx, depot_node in enumerate(depot_nodes):
@@ -483,29 +501,35 @@ def plot_results_multi(routes_gdf, depot_gdf, oriented_edges, results, depot_nod
             depot_gdf["dist_tmp_for_label"] = depot_gdf.geometry.distance(Point(node_x, node_y))
             nearest = depot_gdf.loc[depot_gdf["dist_tmp_for_label"].idxmin()]
             geom = nearest.geometry
-            ax.text(geom.x + 1000, geom.y + 1000, str(depot_idx + 1),
+            ax.text(geom.x + 1000, geom.y + 1000, str(depot_idx+1),
                     fontsize=10, color="black", weight="bold", zorder=6)
         depot_gdf.drop(columns=["dist_tmp_for_label"], inplace=True, errors="ignore")
 
-    cmap = plt.cm.get_cmap("tab10")
-    for ridx, (depot_idx, vehicle_routes, _, total, avg_hours) in enumerate(results):
-        color = cmap(depot_idx % 10)
-        per_depot_set = set()
-        for vnum, vlist, score, cnt in vehicle_routes:
-            if isinstance(vlist, list):
-                per_depot_set.update(vlist)
-        for vnum, route, travel_m, new_count in vehicle_routes:
-            if not route:
-                continue
-            for e_idx in route:
-                a, b = oriented_edges[e_idx]
-                ax.plot([a[0], b[0]], [a[1], b[1]], color=color, linewidth=2.0, alpha=0.9, zorder=3)
-        ax.text(0.01, 0.98 - ridx * 0.04,
-                f"Depot {depot_idx+1}: {len(per_depot_set)}/{total} edges | Avg hrs/veh: {avg_hours:.1f}",
+    cmap = plt.colormaps.get_cmap("tab10")
+
+    for ridx, entry in enumerate(results):
+        (depot_idx, vehicle_routes, n_global_covered, total_edges,
+         total_distance_depot_m, avg_time_per_vehicle_h, avg_distance_per_vehicle_m) = entry
+
+        color = cmap(depot_idx % cmap.N)
+        depot_covered = set()
+        for vnum, vehicle_edges, dist_m, n_edges in vehicle_routes:
+            depot_covered.update(vehicle_edges)
+            # Draw each vehicle's route (different alpha per vehicle optional)
+            for e_idx in vehicle_edges:
+                if 0 <= e_idx < len(oriented_edges):
+                    a, b = oriented_edges[e_idx]
+                    ax.plot([a[0], b[0]], [a[1], b[1]], color=color, alpha=0.7, linewidth=2.2, zorder=3)
+
+        # Per-depot summary on left
+        ax.text(0.01, 0.98 - ridx*0.04,
+                f"Depot {depot_idx+1}: {len(depot_covered)}/{total_edges} edges | "
+                f"Total {total_distance_depot_m/1000:.2f} km | "
+                f"Avg time/veh {avg_time_per_vehicle_h:.2f} h",
                 transform=ax.transAxes, color=color, fontsize=9)
 
     ax.set_aspect("equal")
-    ax.set_title("Multi-Depot Multi-Vehicle ACO Results (Per-depot Coverage & Avg Hours)")
+    ax.set_title("Multi-Depot Multi-Vehicle ACO Results (Per-depot Coverage + Distances & Time)")
     plt.tight_layout()
     plt.show()
 
